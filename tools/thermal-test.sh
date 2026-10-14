@@ -2,11 +2,11 @@
 # Watchdog-protected thermal test. Run as root:
 #   sudo tools/thermal-test.sh <label> <seconds> <load command...>
 # Logs every 2 s (temps, CPU/GPU watts, EC fan duty, Cooler Boost, GPU throttle
-# reasons) and kills the load if the EC sensors reach 85 C, or CPU/GPU/THRM stay
-# at their limits for 3 samples. Reads the EC through ec_sys with writes off.
+# reasons) and kills the load if an EC sensor reaches SEN_MAX (default 85 C), or
+# CPU/GPU/THRM stay at their limits for 3 samples. Reads the EC with writes off.
 label=$1 dur=$2; shift 2
 OUT=${OUT_DIR:-.}/thermal-test-$label.log
-SEN_MAX=85 CPU_MAX=97 GPU_MAX=88 THRM_MAX=97
+SEN_MAX=${SEN_MAX:-85} CPU_MAX=97 GPU_MAX=88 THRM_MAX=97
 RAPL=/sys/class/powercap/intel-rapl:0
 modprobe ec_sys write_support=0
 zt() { local z; for z in /sys/class/thermal/thermal_zone*; do [[ $(<"$z/type") == "$1" ]] && { echo $(($(<"$z/temp") / 1000)); return; }; done; echo 0; }

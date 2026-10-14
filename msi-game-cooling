@@ -1,117 +1,184 @@
 #!/usr/bin/env bash
-# msi-game-cooling: while the NVIDIA GPU is busy (a game), turn on MSI Cooler
-# Boost and give the CPU MSI's "NVIDIA active" power limits, the way MSI
-# Center does on Windows. Undo both when the GPU goes idle.
+# msi-game-cooling: keep MSI gaming laptops from overheating and hard-powering
+# off in long games, with the fans left completely stock. While the NVIDIA GPU
+# is busy (a game), it holds MSI's EC temperature sensors under a target by
+# trimming CPU power and capping GPU clocks only as far as needed, and gives the
+# performance back as they cool, like Intel DTT's passive policy on Windows.
+# Cooler Boost is an emergency brake that should never fire.
 #
 # Why (MSI Cyborg 15 A13VE, EC firmware 15K1IMS1.110):
-# - The EC's factory fan curve tops out at 78 % (~4700 RPM) even at 100 C, and
-#   Linux never changes it. Under a game the EC sensors (SEN3/SEN4) climbed to
-#   92 C until the EC cut power. Cooler Boost runs both fans at
-#   full speed (~6200 RPM); with it the same load levels off at 77-80 C.
+# - With stock fans (Balanced/"comfort": ~3600 RPM max, factory curve tops out
+#   at 78 %) a long Ultra game made the EC sensors (SEN3/SEN4) climb to 92 C
+#   until the EC cut power. Nothing on Linux reacts to those sensors.
 # - MSI's DPTF tables limit the CPU to 30/30 W while the NVIDIA GPU is active
-#   (AC balance_discrete) but Linux starts from the iGPU-only 45/70 W profile;
-#   the CPU's 70 W burst on top of the GPU took it to 95 C in 17 s.
+#   (AC balance_discrete), but Linux starts from the iGPU-only 45/70 W profile.
 #
-# How: Cooler Boost through the msi-ec driver (msi-ec-dkms-git; the in-kernel
-# copy rejects this firmware). CPU limits through the MSR RAPL limits
-# (intel-rapl:0); thermald owns the MMIO ones and the lower of the two wins.
+# How: CPU limits through the MSR RAPL limits (intel-rapl:0; thermald owns the
+# MMIO ones and the lower of the two wins). GPU clocks through
+# `nvidia-smi -lgc` (the GPU power limit is locked on laptops). Cooler Boost
+# through the msi-ec driver (msi-ec-dkms-git; the in-kernel copy rejects this
+# firmware).
 
 set -u
 
 RAPL=/sys/class/powercap/intel-rapl:0
 BOOST=/sys/devices/platform/msi-ec/cooler_boost
-GAME_W=30000000      # MSI AC balance_discrete PL1/PL2, in microwatts
 BUSY_W=12            # GPU draw that counts as "a game is running"; games pull
                      # 35-45 W, an open Steam client keeps the GPU at 3-10 W
 BUSY_SAMPLES=2       # 2 x 5 s at or above BUSY_W -> game mode
 IDLE_SAMPLES=12      # 12 x 5 s below BUSY_W -> back to normal
 INTERVAL=5
 
-# Remember the firmware's values once per boot, so a restart mid-game does not
-# mistake the lowered limits for the originals.
-ORIG=/run/msi-game-cooling.orig
-[[ -s $ORIG ]] || echo "$(cat "$RAPL/constraint_0_power_limit_uw") $(cat "$RAPL/constraint_1_power_limit_uw")" >"$ORIG"
-read -r ORIG_PL1 ORIG_PL2 <"$ORIG"
+# Thermal controller on the hottest EC sensor (SEN2-4), one level at a time:
+# - down every DOWN_EVERY samples while at or above HOT, every sample when at
+#   or above HOT+2, and early when within 2 C of HOT and rising >= 2 C in 15 s;
+# - up only after UP_AFTER samples in a row at or below COOL (slow, so the
+#   level settles instead of flapping).
+HOT=82
+COOL=78
+DOWN_EVERY=3
+UP_AFTER=12
+# Levels: CPU PL1=PL2 (W) and GPU max clock (MHz, 0 = no cap). Level 0 is MSI's
+# own NVIDIA-active CPU limit with the GPU untouched. The CPU never goes below
+# 20 W: at 15 W a UE5 game plus the desktop starved input (key-release events
+# arrived late, so keys auto-repeated). The GPU makes most of the heat anyway.
+LEVEL_CPU=(30 27 25 23 22 21 20 20 20 20 20)
+LEVEL_GPU=(0 2400 2100 1900 1750 1600 1450 1300 1150 1000 900)
+BRAKE_ON=88          # Cooler Boost on (emergency); the EC cut power after ~15 min at 92 C
+BRAKE_OFF=80
 
-[[ -w $BOOST ]] || echo "warning: $BOOST missing (msi-ec not loaded?); fans stay on the factory curve"
+nv() { timeout 10 nvidia-smi "$@"; } # a hung driver call must not stall the loop
 
-set_limits() { # pl1 pl2
-  echo "$1" >"$RAPL/constraint_0_power_limit_uw"
-  echo "$2" >"$RAPL/constraint_1_power_limit_uw"
+# Remember the firmware's CPU limits once per boot, so a restart mid-game does
+# not mistake our own limits for the originals.
+ORIG=/run/msi-game-cooling.state
+if [[ ! -s $ORIG ]]; then
+  p1=$(cat "$RAPL/constraint_0_power_limit_uw" 2>/dev/null) p2=$(cat "$RAPL/constraint_1_power_limit_uw" 2>/dev/null)
+  [[ $p1 =~ ^[0-9]+$ && $p2 =~ ^[0-9]+$ ]] || { echo "cannot read $RAPL limits" >&2; exit 1; }
+  echo "PL=\"$p1 $p2\"" >"$ORIG"
+fi
+PL=''
+source "$ORIG"
+read -r ORIG_PL1 ORIG_PL2 <<<"$PL"
+
+[[ -w $BOOST ]] || echo "warning: $BOOST missing (msi-ec not loaded?); no emergency brake"
+
+set_cpu() { # watts for PL1 and PL2, or "orig"
+  local p1 p2
+  if [[ $1 == orig ]]; then p1=$ORIG_PL1 p2=$ORIG_PL2; else p1=$(($1 * 1000000)) p2=$p1; fi
+  [[ $(cat "$RAPL/constraint_0_power_limit_uw") == "$p1" ]] || echo "$p1" >"$RAPL/constraint_0_power_limit_uw"
+  [[ $(cat "$RAPL/constraint_1_power_limit_uw") == "$p2" ]] || echo "$p2" >"$RAPL/constraint_1_power_limit_uw"
 }
 
-set_boost() { [[ -w $BOOST ]] && echo "$1" >"$BOOST"; }
-
-enter_game() {
-  set_limits "$GAME_W" "$GAME_W"
-  set_boost on
+gpu_cap=-1 # what the driver last accepted (-1 = unknown, forces a call)
+set_gpu() { # max MHz, 0 = no cap; remembered only when the driver accepts it
+  ((gpu_cap == $1)) && return
+  if (($1 == 0)); then nv -rgc >/dev/null 2>&1 && gpu_cap=0
+  else nv -lgc "0,$1" >/dev/null 2>&1 && gpu_cap=$1; fi
 }
+
+set_boost() { [[ -w $BOOST ]] && [[ $(cat "$BOOST") != "$1" ]] && echo "$1" >"$BOOST"; }
 
 restore() {
-  set_limits "$ORIG_PL1" "$ORIG_PL2"
-  set_boost off
-  echo "restored: Cooler Boost off, CPU limits PL1=$((ORIG_PL1 / 1000000))W PL2=$((ORIG_PL2 / 1000000))W"
+  set_cpu orig
+  set_gpu 0
+  echo "back to stock: CPU limits $((ORIG_PL1 / 1000000))/$((ORIG_PL2 / 1000000))W, GPU clocks uncapped"
 }
-trap 'restore; exit 0' TERM INT
 
-zone_temp() { # thermal zone type -> degrees C
+zone_temp() { # thermal zone type -> degrees C (0 if missing)
   local z
   for z in /sys/class/thermal/thermal_zone*; do
     [[ $(cat "$z/type") == "$1" ]] && { echo $(($(cat "$z/temp") / 1000)); return; }
   done
-  echo '?'
+  echo 0
 }
 
-# Real fan speed from the tachometer (the EC duty registers show the curve's
-# target, not what Cooler Boost actually does).
 fan_rpm() {
   local h
   for h in /sys/class/hwmon/hwmon*; do
-    [[ $(cat "$h/name") == msi_wmi_platform ]] && { cat "$h/fan1_input"; return; }
+    [[ $(cat "$h/name" 2>/dev/null) == msi_wmi_platform ]] && { cat "$h/fan1_input"; return; }
   done
   echo '?'
 }
 
-# CPU package watts over one second, from the RAPL energy counter (microjoules).
-cpu_watts() {
+cpu_watts() { # CPU package watts over one second, from the RAPL energy counter
   local a b; a=$(cat "$RAPL/energy_uj"); sleep 1; b=$(cat "$RAPL/energy_uj")
   ((b >= a)) && echo $(((b - a) / 1000000)) || echo '?'
 }
 
+level_str() { echo "L$level (CPU ${LEVEL_CPU[level]}W, GPU $( ((LEVEL_GPU[level])) && echo "max ${LEVEL_GPU[level]}MHz" || echo uncapped))"; }
+
 log_temps() {
   echo "temps: cpu=$(zone_temp x86_pkg_temp)C cpu_draw=$(cpu_watts)W gpu=${gpu_t}C gpu_draw=${gpu_w}W" \
-    "SEN2=$(zone_temp SEN2)C SEN3=$(zone_temp SEN3)C SEN4=$(zone_temp SEN4)C THRM=$(zone_temp acpitz)C" \
-    "fan=$(fan_rpm)rpm cooler_boost=$(cat "$BOOST" 2>/dev/null || echo '?')" \
-    "cpu_limits=$(($(cat "$RAPL/constraint_0_power_limit_uw") / 1000000))/$(($(cat "$RAPL/constraint_1_power_limit_uw") / 1000000))W"
+    "gpu_clock=$(nv --query-gpu=clocks.gr --format=csv,noheader,nounits 2>/dev/null)MHz" \
+    "SEN2=$s2 SEN3=$s3 SEN4=$s4 THRM=$(zone_temp acpitz)C fan=$(fan_rpm)rpm level=$(level_str)"
 }
 
-echo "started; firmware CPU limits PL1=$((ORIG_PL1 / 1000000))W PL2=$((ORIG_PL2 / 1000000))W"
-game=0 busy=0 idle=0 tick=0
+game=0 busy=0 idle=0 tick=0 brake=0 level=0 since_down=0 cool_run=0 last_t=$EPOCHSECONDS
+h1=0 h2=0 h3=0 # hottest-sensor history, 5/10/15 s ago
+trap 'exit 0' TERM INT
+trap '((brake)) && set_boost off; restore' EXIT
+
+# A crash or restart may have left our limits behind: start from stock.
+restore
+(($(zone_temp SEN3) > 0)) || echo "warning: EC sensor zones (SEN2-4) not found; the controller cannot see the heat that matters"
+echo "started; firmware CPU limits $((ORIG_PL1 / 1000000))/$((ORIG_PL2 / 1000000))W; fans stay stock"
+
 while :; do
-  # Empty output (NVIDIA off in Integrated mode, driver busy) counts as idle.
-  read -r gpu_w gpu_t < <(nvidia-smi --query-gpu=power.draw,temperature.gpu \
+  # Wall-clock jump = suspend/resume: the driver and EC may have reset our caps.
+  now=$EPOCHSECONDS
+  ((now - last_t > 4 * INTERVAL)) && gpu_cap=-1
+  last_t=$now
+
+  # Empty or [N/A] output (NVIDIA off in Integrated mode, driver busy) counts as idle.
+  read -r gpu_w gpu_t < <(nv --query-gpu=power.draw,temperature.gpu \
     --format=csv,noheader,nounits 2>/dev/null | tr -d ',' | awk '{printf "%d %s\n", $1, $2}')
   gpu_w=${gpu_w:-0} gpu_t=${gpu_t:-?}
+  s2=$(zone_temp SEN2) s3=$(zone_temp SEN3) s4=$(zone_temp SEN4)
+  hot=$((s2 > s3 ? s2 : s3)); hot=$((hot > s4 ? hot : s4))
 
   if ((gpu_w >= BUSY_W)); then busy=$((busy + 1)) idle=0
   else idle=$((idle + 1)) busy=0
   fi
 
   if ((!game && busy >= BUSY_SAMPLES)); then
-    game=1 tick=0
-    echo "NVIDIA GPU busy (${gpu_w}W): Cooler Boost on, CPU limits -> 30/30W (MSI balance_discrete)"
+    game=1 tick=0 since_down=0 cool_run=0
+    # Back from a short break with the chassis still warm: keep the last level.
+    ((hot <= COOL)) && level=0
+    echo "NVIDIA GPU busy (${gpu_w}W): holding EC sensors under ${HOT}C, start at $(level_str)"
   elif ((game && idle >= IDLE_SAMPLES)); then
     game=0
     restore
   fi
 
   if ((game)); then
-    # Re-assert every sample: firmware can reset RAPL and the EC can drop
-    # Cooler Boost (suspend/resume, Fn hotkey).
-    [[ $(cat "$RAPL/constraint_0_power_limit_uw") == "$GAME_W" &&
-      $(cat "$RAPL/constraint_1_power_limit_uw") == "$GAME_W" &&
-      $(cat "$BOOST" 2>/dev/null) != off ]] || enter_game
+    since_down=$((since_down + 1))
+    ((hot <= COOL)) && cool_run=$((cool_run + 1)) || cool_run=0
+    rising=$((hot >= HOT - 2 && hot - h3 >= 2))
+    if ((hot == 0)); then
+      : # sensors unreadable: hold the current level
+    elif ((level < ${#LEVEL_CPU[@]} - 1)) &&
+      (((hot >= HOT + 2) || (hot >= HOT && since_down >= DOWN_EVERY) || (rising && since_down >= DOWN_EVERY))); then
+      level=$((level + 1)) since_down=0 cool_run=0
+      echo "EC sensors ${hot}C$( ((rising)) && echo ", rising"): step down to $(level_str)"
+    elif ((level > 0 && cool_run >= UP_AFTER)); then
+      level=$((level - 1)) cool_run=0
+      echo "EC sensors ${hot}C for a minute: step up to $(level_str)"
+    fi
+    # Re-applied every sample: firmware resets RAPL after suspend/resume.
+    set_cpu "${LEVEL_CPU[level]}"
+    set_gpu "${LEVEL_GPU[level]}"
     ((tick++ % (60 / INTERVAL) == 0)) && log_temps
   fi
-  sleep "$INTERVAL"
+  h3=$h2 h2=$h1 h1=$hot
+
+  # Emergency brake, in or out of game mode. Should never fire.
+  if ((!brake && hot >= BRAKE_ON)); then
+    brake=1; echo "EC sensors at ${hot}C: Cooler Boost on (emergency)"
+  elif ((brake && hot <= BRAKE_OFF)); then
+    brake=0; set_boost off; echo "EC sensors at ${hot}C: Cooler Boost off"
+  fi
+  ((brake)) && set_boost on # re-asserted: the EC may drop it on resume
+
+  sleep "$INTERVAL" & wait $!
 done
