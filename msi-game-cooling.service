@@ -1,0 +1,15 @@
+[Unit]
+Description=MSI Cooler Boost and NVIDIA-active CPU limits while the dGPU is busy
+# Start after the login screen is up so nvidia-smi never competes with the
+# display manager greeter during boot.
+After=graphical.target thermald.service
+
+[Service]
+ExecStartPre=/usr/bin/modprobe intel_rapl_msr
+ExecStartPre=-/usr/bin/modprobe msi_ec
+ExecStart=/usr/local/bin/msi-game-cooling
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical.target

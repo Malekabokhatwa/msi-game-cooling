@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# msi-game-cooling: while the NVIDIA GPU is busy (a game), turn on MSI Cooler
+# Boost and give the CPU MSI's "NVIDIA active" power limits, the way MSI
+# Center does on Windows. Undo both when the GPU goes idle.
+#
+# Why (MSI Cyborg 15 A13VE, EC firmware 15K1IMS1.110):
+# - The EC's factory fan curve tops out at 78 % (~4700 RPM) even at 100 C, and
+#   Linux never changes it. Under a game the EC sensors (SEN3/SEN4) climbed to
+#   92 C until the EC cut power. Cooler Boost runs both fans at
+#   full speed (~6200 RPM); with it the same load levels off at 77-80 C.
+# - MSI's DPTF tables limit the CPU to 30/30 W while the NVIDIA GPU is active
+#   (AC balance_discrete) but Linux starts from the iGPU-only 45/70 W profile;
+#   the CPU's 70 W burst on top of the GPU took it to 95 C in 17 s.
+#
+# How: Cooler Boost through the msi-ec driver (msi-ec-dkms-git; the in-kernel
+# copy rejects this firmware). CPU limits through the MSR RAPL limits
+# (intel-rapl:0); thermald owns the MMIO ones and the lower of the two wins.
+
+set -u
+
+RAPL=/sys/class/powercap/intel-rapl:0
+BOOST=/sys/devices/platform/msi-ec/cooler_boost
+GAME_W=30000000      # MSI AC balance_discrete PL1/PL2, in microwatts
+BUSY_W=12            # GPU draw that counts as "a game is running"; games pull
+                     # 35-45 W, an open Steam client keeps the GPU at 3-10 W
+BUSY_SAMPLES=2       # 2 x 5 s at or above BUSY_W -> game mode
+IDLE_SAMPLES=12      # 12 x 5 s below BUSY_W -> back to normal
+INTERVAL=5
+
+# Remember the firmware's values once per boot, so a restart mid-game does not
+# mistake the lowered limits for the originals.
+ORIG=/run/msi-game-cooling.orig
+[[ -s $ORIG ]] || echo "$(cat "$RAPL/constraint_0_power_limit_uw") $(cat "$RAPL/constraint_1_power_limit_uw")" >"$ORIG"
+read -r ORIG_PL1 ORIG_PL2 <"$ORIG"
+
+[[ -w $BOOST ]] || echo "warning: $BOOST missing (msi-ec not loaded?); fans stay on the factory curve"
+
+set_limits() { # pl1 pl2
+  echo "$1" >"$RAPL/constraint_0_power_limit_uw"
+  echo "$2" >"$RAPL/constraint_1_power_limit_uw"
+}
+
+set_boost() { [[ -w $BOOST ]] && echo "$1" >"$BOOST"; }
+
+enter_game() {
+  set_limits "$GAME_W" "$GAME_W"
+  set_boost on
+}
+
+restore() {
+  set_limits "$ORIG_PL1" "$ORIG_PL2"
+  set_boost off
+  echo "restored: Cooler Boost off, CPU limits PL1=$((ORIG_PL1 / 1000000))W PL2=$((ORIG_PL2 / 1000000))W"
+}
+trap 'restore; exit 0' TERM INT
+
+zone_temp() { # thermal zone type -> degrees C
+  local z
+  for z in /sys/class/thermal/thermal_zone*; do
+    [[ $(cat "$z/type") == "$1" ]] && { echo $(($(cat "$z/temp") / 1000)); return; }
+  done
+  echo '?'
+}
+
+# Real fan speed from the tachometer (the EC duty registers show the curve's
+# target, not what Cooler Boost actually does).
+fan_rpm() {
+  local h
+  for h in /sys/class/hwmon/hwmon*; do
+    [[ $(cat "$h/name") == msi_wmi_platform ]] && { cat "$h/fan1_input"; return; }
+  done
+  echo '?'
+}
+
+# CPU package watts over one second, from the RAPL energy counter (microjoules).
+cpu_watts() {
+  local a b; a=$(cat "$RAPL/energy_uj"); sleep 1; b=$(cat "$RAPL/energy_uj")
+  ((b >= a)) && echo $(((b - a) / 1000000)) || echo '?'
+}
+
+log_temps() {
+  echo "temps: cpu=$(zone_temp x86_pkg_temp)C cpu_draw=$(cpu_watts)W gpu=${gpu_t}C gpu_draw=${gpu_w}W" \
+    "SEN2=$(zone_temp SEN2)C SEN3=$(zone_temp SEN3)C SEN4=$(zone_temp SEN4)C THRM=$(zone_temp acpitz)C" \
+    "fan=$(fan_rpm)rpm cooler_boost=$(cat "$BOOST" 2>/dev/null || echo '?')" \
+    "cpu_limits=$(($(cat "$RAPL/constraint_0_power_limit_uw") / 1000000))/$(($(cat "$RAPL/constraint_1_power_limit_uw") / 1000000))W"
+}
+
+echo "started; firmware CPU limits PL1=$((ORIG_PL1 / 1000000))W PL2=$((ORIG_PL2 / 1000000))W"
+game=0 busy=0 idle=0 tick=0
+while :; do
+  # Empty output (NVIDIA off in Integrated mode, driver busy) counts as idle.
+  read -r gpu_w gpu_t < <(nvidia-smi --query-gpu=power.draw,temperature.gpu \
+    --format=csv,noheader,nounits 2>/dev/null | tr -d ',' | awk '{printf "%d %s\n", $1, $2}')
+  gpu_w=${gpu_w:-0} gpu_t=${gpu_t:-?}
+
+  if ((gpu_w >= BUSY_W)); then busy=$((busy + 1)) idle=0
+  else idle=$((idle + 1)) busy=0
+  fi
+
+  if ((!game && busy >= BUSY_SAMPLES)); then
+    game=1 tick=0
+    echo "NVIDIA GPU busy (${gpu_w}W): Cooler Boost on, CPU limits -> 30/30W (MSI balance_discrete)"
+  elif ((game && idle >= IDLE_SAMPLES)); then
+    game=0
+    restore
+  fi
+
+  if ((game)); then
+    # Re-assert every sample: firmware can reset RAPL and the EC can drop
+    # Cooler Boost (suspend/resume, Fn hotkey).
+    [[ $(cat "$RAPL/constraint_0_power_limit_uw") == "$GAME_W" &&
+      $(cat "$RAPL/constraint_1_power_limit_uw") == "$GAME_W" &&
+      $(cat "$BOOST" 2>/dev/null) != off ]] || enter_game
+    ((tick++ % (60 / INTERVAL) == 0)) && log_temps
+  fi
+  sleep "$INTERVAL"
+done
