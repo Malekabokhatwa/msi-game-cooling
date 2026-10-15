@@ -19,6 +19,35 @@ there is only one copy of the script.
 - Report what changed **before committing** when he asks for that.
 - Never touch the Windows NVMe.
 
+## Handoff: where this stands (2026-10-15)
+
+- **Service:** installed and enabled, but stopped for testing. It stays
+  `inactive` until the next boot or `sudo systemctl start msi-game-cooling`.
+  Malek dislikes the throttling it does and wants "same fps, stock fans, no crashes".
+- **Malek forbids undervolting/overvolting** (GPU VF-curve offsets, etc.). One
+  benchmark with `nvmlDeviceSetGpcClkVfOffset` was run and fully reset to 0; never
+  do it again. `mangohud` and `python-nvidia-ml-py` were installed for that.
+- **Forensics (read-only, verified):** no software change before the first failure
+  (same kernel 7.2.5-3 since Sep 16, same NVIDIA 610.57.04 since install, no
+  thermal/power/fan config change). Schedule I ran 2-17 h sessions fine up to
+  Oct 9; failures began Oct 10 and worsened daily (Xid 79 after ~2 h and ~13 h,
+  then EC power cuts after 45/17/28 min on Oct 14). The AC power profile has
+  been `performance` since install day (Omarchy default, `~/.local/state/
+  omarchy/powerprofiles/ac`), so it is not the change.
+- **Extreme Performance tested (2026-10-15):** EC `turbo` shift mode + factory
+  curve + auto fans, nothing capped: fans 4660 RPM (factory 78 % in turbo), CPU
+  32 W + GPU 37 W, EC sensors 83 C at 4 min, 88 C at ~5.5 min (watchdog abort).
+  So no firmware fan mode holds full power on this unit; restored to comfort.
+- **Most likely cause:** degraded cooling (dust in fins, blocked vents, paste),
+  given the timeline. Malek has said "hardware is fine", so present evidence, not
+  insistence. He offered an EC reset.
+- **Next step (task assigned to Malek):** EC reset (shut down, unplug charger, hold
+  power 30 s) and a vent/surface check. Then re-run the identical 20-min test
+  (`tools/thermal-test.sh` with `SEN_MAX=88`, Sort The Capybaras appid 5130480,
+  service stopped, EC comfort/auto/factory curve, then turbo) and compare with the
+  numbers above. If temps are unchanged, the remaining options are physical
+  (cleaning/repaste, raising the back, cooling pad) or the controller in this repo.
+
 ## How it works now
 
 `msi-game-cooling` (bash, root, systemd unit `After=graphical.target`):
