@@ -41,7 +41,14 @@ there is only one copy of the script.
 - **Most likely cause:** degraded cooling (dust in fins, blocked vents, paste),
   given the timeline. Malek has said "hardware is fine", so present evidence, not
   insistence. He offered an EC reset.
-- **Next step (task assigned to Malek):** EC reset (shut down, unplug charger, hold
+- **EC reset done (2026-10-15), no change:** EC came back comfort/auto/factory
+  curve/CB off (same as before). Same uncapped test (service stopped, stock fans,
+  Capybaras Ultra, CPU 30 W + GPU 39 W): SEN 81 C at ~1 min of load, 84 C at
+  ~1.5 min, watchdog abort SEN4=88 C at 3:15 total (~2.5 min under load). Fans
+  hit the curve max (78 %). Matches the pre-reset numbers, so firmware/EC state
+  is ruled out; only physical cooling (cleaning/repaste, raised back, cooling
+  pad) or the throttling controller remain.
+- **Previous next step (done):** EC reset (shut down, unplug charger, hold
   power 30 s) and a vent/surface check. Then re-run the identical 20-min test
   (`tools/thermal-test.sh` with `SEN_MAX=88`, Sort The Capybaras appid 5130480,
   service stopped, EC comfort/auto/factory curve, then turbo) and compare with the
